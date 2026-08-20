@@ -4,69 +4,108 @@ local Players = game:GetService("Players")
 
 local PlaceId = game.PlaceId
 local JobId = game.JobId
+local LocalPlayer = Players.LocalPlayer
+
+-- Configuration
+local MAX_PAGES = 15          -- How many pages to scan (100 servers per page)
+local RETRY_DELAY = 5         -- Seconds to wait before retrying the whole process on failure
+local BLACKLIST = {}          -- Keeps track of servers that failed to teleport
+
+function fetchServers(cursor)
+    local url = string.format(
+        "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100&cursor=%s",
+        PlaceId, 
+        cursor or ""
+    )
+    
+    local success, result = pcall(function()
+        return game:HttpGet(url) -- Using HttpGet for executors
+    end)
+    
+    if success then
+        local data = HttpService:JSONDecode(result)
+        if data and data.data then
+            return data
+        end
+    end
+    
+    return nil
+end
 
 function hopToLowServer()
     local cursor = ""
     local attempts = 0
-    local maxPages = 10 -- How many pages (100 servers each) to search through
+    
+    print("Searching for a low-player server...")
 
-    print("Searching for the best low-player server...")
+    while attempts < MAX_PAGES do
+        local result = fetchServers(cursor)
+        
+        if not result then
+            warn("API Rate limit or Error. Waiting 5 seconds...")
+            task.wait(5)
+            attempts = attempts + 1
+            continue
+        end
 
-    while attempts < maxPages do
-        -- API to fetch public servers, sorted by lowest player count (Asc)
-        local url = string.format(
-            "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100&cursor=%s",
-            PlaceId, 
-            cursor
-        )
+        local possibleServers = {}
 
-        local success, result = pcall(function()
-            return HttpService:JSONDecode(game:HttpGet(url))
-        end)
-
-        if success and result and result.data then
-            local possibleServers = {}
-
-            for _, server in ipairs(result.data) do
-                -- Criteria: Not full, not the current server, and has 1+ players
-                if server.playing < server.maxPlayers and server.id ~= JobId then
-                    table.insert(possibleServers, server)
-                end
+        for _, server in ipairs(result.data) do
+            -- Filter: Not full, not current, not blacklisted, and has at least 1 player (to avoid broken/dead servers)
+            if server.playing < server.maxPlayers 
+               and server.id ~= JobId 
+               and not BLACKLIST[server.id] 
+               and server.playing > 0 then
+                table.insert(possibleServers, server)
             end
+        end
 
-            if #possibleServers > 0 then
-                -- Pick a random server from the first 5 "best" results 
-                -- This prevents everyone from trying to join the exact same 1-player server
-                local target = possibleServers[math.random(1, math.min(#possibleServers, 5))]
-                
-                print("Found server with " .. target.playing .. " players. Teleporting...")
-                
-                local tpSuccess, tpError = pcall(function()
-                    TeleportService:TeleportToPlaceInstance(PlaceId, target.id, Players.LocalPlayer)
-                end)
-                
-                if not tpSuccess then
-                    warn("Teleport failed: " .. tostring(tpError))
-                else
-                    return -- Exit script if teleport starts
-                end
-            end
+        if #possibleServers > 0 then
+            -- Sort by player count (Ascending) just in case the API order is messy
+            table.sort(possibleServers, function(a, b)
+                return a.playing < b.playing
+            end)
 
-            -- Move to the next page if no suitable server found
-            if result.nextPageCursor then
-                cursor = result.nextPageCursor
-                attempts = attempts + 1
+            -- Pick from the top 5 to avoid everyone hitting the same server at once
+            local target = possibleServers[math.random(1, math.min(#possibleServers, 5))]
+            
+            print(string.format("Attempting join: %s (%s/%s players)", target.id, target.playing, target.maxPlayers))
+            
+            -- Track the attempt
+            local tpSuccess, tpError = pcall(function()
+                TeleportService:TeleportToPlaceInstance(PlaceId, target.id, LocalPlayer)
+            end)
+
+            if not tpSuccess then
+                warn("Teleport call failed, blacklisting server and trying another. Error: " .. tostring(tpError))
+                BLACKLIST[target.id] = true
+                -- We don't return here; the loop continues to find another server
             else
-                break
+                -- Teleport initiated, wait a moment to see if it actually goes through
+                task.wait(2) 
             end
+        end
+
+        if result.nextPageCursor then
+            cursor = result.nextPageCursor
+            attempts = attempts + 1
         else
-            warn("API Error or rate-limited. Retrying in 2 seconds...")
-            task.wait(2)
+            -- No more pages left
+            break
         end
     end
 
-    print("Could not find a suitable small server after searching " .. (attempts * 100) .. " servers.")
+    return false
 end
 
--- Execute the hop
-hopToLowServer()
+-- MAIN AUTO-RETRY LOOP
+task.spawn(function()
+    while true do
+        local success = hopToLowServer()
+        
+        if not success then
+            warn("Could not find or join a server. Retrying the entire search in " .. RETRY_DELAY .. "s...")
+            task.wait(RETRY_DELAY)
+        end
+    end
+end)
